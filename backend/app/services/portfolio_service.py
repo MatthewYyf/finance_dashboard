@@ -1,3 +1,9 @@
+from datetime import datetime
+from sqlalchemy.orm import Session
+
+from app.db.models import PortfolioPosition, PortfolioSnapshot
+from app.services.market_data_service import get_current_prices
+
 import time
 import requests
 import xml.etree.ElementTree as ET
@@ -167,7 +173,7 @@ def positions_df_to_list(df: pd.DataFrame) -> list:
     return positions
 
 
-def get_portfolio_data():
+def fetch_portfolio():
     reference_code = send_flex_request(TOKEN, QUERY_ID)
     print("Reference code:", reference_code)
 
@@ -180,6 +186,111 @@ def get_portfolio_data():
 
     return {
         "total_value": total,
-        "daily_change": 1.24,
+        "cash": cash,
+        "stock": stock,
         "positions": positions_list,
+    }
+
+
+def get_saved_portfolio(db: Session):
+    snapshot = (
+        db.query(PortfolioSnapshot)
+        .order_by(PortfolioSnapshot.updated_at.desc())
+        .first()
+    )
+
+    positions = db.query(PortfolioPosition).all()
+
+    if not snapshot:
+        return {
+            "total_value": 0,
+            "cash": 0,
+            "updated_at": None,
+            "positions": [],
+            "total_unrealized_gain": 0,
+        }
+
+    # When only saved snapshot (no quotes), unrealized gain cannot be reliably calculated
+    return {
+        "total_value": snapshot.total_value,
+        "cash": snapshot.cash,
+        "stock": snapshot.stock,
+        "updated_at": snapshot.updated_at.isoformat(),
+        "positions": [
+            {
+                "symbol": p.symbol,
+                "shares": p.shares,
+                "avg_cost": p.avg_cost,
+            }
+            for p in positions
+        ],
+        "total_unrealized_gain": None, # Not available in saved snapshot
+    }
+
+def refresh_portfolio(db: Session):
+    fresh_data = fetch_portfolio()
+
+    db.query(PortfolioPosition).delete()
+
+    for pos in fresh_data["positions"]:
+        db.add(
+            PortfolioPosition(
+                symbol=pos["symbol"],
+                shares=pos["shares"],
+                avg_cost=pos["avg_cost"],
+            )
+        )
+
+    snapshot = PortfolioSnapshot(
+        total_value=fresh_data["total_value"],
+        cash=fresh_data["cash"],
+        stock=fresh_data["stock"],
+    )
+
+    db.add(snapshot)
+    db.commit()
+
+    return get_saved_portfolio(db)
+
+def get_live_portfolio(db: Session):
+    saved = get_saved_portfolio(db)
+    symbols = [p["symbol"] for p in saved["positions"]]
+    prices = get_current_prices(symbols)
+
+    live_positions = []
+    live_stock_value = 0.0
+    total_unrealized_gain = 0.0
+
+    for p in saved["positions"]:
+        current_price = prices.get(p["symbol"])
+        market_value = current_price * p["shares"] if current_price is not None else None
+        unrealized_gain = (
+            (current_price - p["avg_cost"]) * p["shares"]
+            if current_price is not None
+            else None
+        )
+
+        if market_value is not None:
+            live_stock_value += market_value
+
+        if unrealized_gain is not None:
+            total_unrealized_gain += unrealized_gain
+
+        live_positions.append(
+            {
+                **p,
+                "current_price": current_price,
+                "market_value": market_value,
+                "unrealized_gain": unrealized_gain,
+            }
+        )
+
+    return {
+        "total_value": saved["cash"] + live_stock_value,
+        "cash": saved["cash"],
+        "stock": live_stock_value,
+        "updated_at": saved["updated_at"],
+        "quote_updated_at": datetime.utcnow().isoformat(),
+        "positions": live_positions,
+        "total_unrealized_gain": total_unrealized_gain,
     }
